@@ -1,0 +1,144 @@
+"""End-to-end YouTube to Shorts conversion pipeline."""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable
+
+from yt_shorts.analyzer import ClipCandidate, select_clips_with_gemini
+from yt_shorts.downloader import DownloadResult, download_youtube_video
+from yt_shorts.editor import LayoutMode, render_short_clip, resolve_ffmpeg_exe
+
+
+@dataclass
+class RenderedClip:
+    """Metadata and file path for a generated Short."""
+
+    index: int
+    file_path: Path
+    start_time: float
+    end_time: float
+    duration: float
+    hook_title: str
+    reason: str
+    viral_score: int
+
+
+@dataclass
+class PipelineResult:
+    """Complete output of a YouTube-to-Shorts run."""
+
+    video_id: str
+    title: str
+    output_dir: Path
+    clips: list[RenderedClip]
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()
+    return slug[:max_len] or "clip"
+
+
+def run_pipeline(
+    url: str,
+    output_root: Path = Path("output"),
+    num_clips: int = 3,
+    min_sec: float = 15.0,
+    max_sec: float = 30.0,
+    layout: LayoutMode = "blur",
+    burn_captions: bool = True,
+    api_key: str | None = None,
+    model: str | None = None,
+    cookies_from_browser: str | None = None,
+    cookies_file: Path | None = None,
+    max_height: int = 1080,
+    cleanup_cache: bool = True,
+    on_progress: Callable[[str], None] | None = None,
+) -> PipelineResult:
+    """Download a YouTube video, pick 15-30s highlights, and render 9:16 Shorts."""
+    notify = on_progress or (lambda _msg: None)
+
+    ffmpeg_exe = resolve_ffmpeg_exe()
+    notify("Downloading video and captions with yt-dlp...")
+    work_dir = output_root / "_cache"
+    dl: DownloadResult = download_youtube_video(
+        url=url,
+        output_dir=work_dir,
+        ffmpeg_location=ffmpeg_exe,
+        cookies_from_browser=cookies_from_browser,
+        cookies_file=cookies_file,
+        max_height=max_height,
+    )
+
+    notify(f"Downloaded '{dl.title}' ({dl.duration:.0f}s). Selecting top {num_clips} clips...")
+    candidates: list[ClipCandidate] = select_clips_with_gemini(
+        title=dl.title,
+        video_duration=dl.duration,
+        transcript=dl.transcript,
+        heatmap=dl.heatmap,
+        num_clips=num_clips,
+        min_sec=min_sec,
+        max_sec=max_sec,
+        api_key=api_key,
+        model=model,
+    )
+
+    video_out_dir = output_root / dl.video_id
+    video_out_dir.mkdir(parents=True, exist_ok=True)
+    rendered: list[RenderedClip] = []
+
+    for idx, clip in enumerate(candidates, start=1):
+        notify(
+            f"Rendering clip {idx}/{len(candidates)}: "
+            f"{clip.hook_title} ({clip.start_time:.1f}s - {clip.end_time:.1f}s)..."
+        )
+        filename = f"short_{idx:02d}_{_slugify(clip.hook_title)}.mp4"
+        out_path = video_out_dir / filename
+        render_short_clip(
+            source_video=dl.video_path,
+            output_path=out_path,
+            start_time=clip.start_time,
+            end_time=clip.end_time,
+            layout=layout,
+            transcript=dl.transcript,
+            burn_captions=burn_captions,
+            ffmpeg_exe=ffmpeg_exe,
+        )
+        rendered.append(
+            RenderedClip(
+                index=idx,
+                file_path=out_path,
+                start_time=clip.start_time,
+                end_time=clip.end_time,
+                duration=round(clip.end_time - clip.start_time, 2),
+                hook_title=clip.hook_title,
+                reason=clip.reason,
+                viral_score=clip.viral_score,
+            )
+        )
+
+    summary_path = video_out_dir / "clips_summary.json"
+    summary_data = {
+        "video_id": dl.video_id,
+        "title": dl.title,
+        "clips": [{**asdict(c), "file_path": str(c.file_path)} for c in rendered],
+    }
+    summary_path.write_text(json.dumps(summary_data, indent=2), encoding="utf-8")
+
+    if cleanup_cache:
+        dl.video_path.unlink(missing_ok=True)
+        for temp_file in work_dir.iterdir():
+            if temp_file.is_file():
+                temp_file.unlink(missing_ok=True)
+
+    notify(f"Done! Saved {len(rendered)} Shorts to {video_out_dir}")
+
+    return PipelineResult(
+        video_id=dl.video_id,
+        title=dl.title,
+        output_dir=video_out_dir,
+        clips=rendered,
+    )
