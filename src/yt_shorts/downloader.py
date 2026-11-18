@@ -212,7 +212,7 @@ def download_youtube_video(
         },
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
+                "player_client": ["ios", "android", "mweb"],
                 "player_skip": ["configs", "webpage"],
             }
         },
@@ -246,41 +246,29 @@ def download_youtube_video(
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc)
         lower_msg = msg.lower()
-        is_bot_or_403 = (
-            "not a bot" in lower_msg
-            or "the page needs to be reloaded" in lower_msg
-            or "http error 403" in lower_msg
-            or "403: forbidden" in lower_msg
-            or ("sign in to confirm" in lower_msg and "confirm your age" not in lower_msg)
+        is_bot_or_403 = any(
+            phrase in lower_msg
+            for phrase in ["bot", "page needs to be reloaded", "403", "forbidden"]
         )
         if is_bot_or_403:
-            # Attempt 2: Retry with embedded/mobile web clients and skipped configs/webpage.
-            attempt2_opts = {
-                **ydl_opts,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": ["tv_embedded", "mweb"],
-                        "player_skip": ["webpage", "configs"],
-                    }
-                },
+            # Attempt 2: Retry purely with native mobile clients (ios/android) without web cookies
+            # so desktop session cookies don't trigger mobile token mismatches on public videos.
+            mobile_fallback_opts = {
+                k: v
+                for k, v in ydl_opts.items()
+                if k not in ("cookiefile", "cookiesfrombrowser")
+            }
+            mobile_fallback_opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["ios", "android"],
+                    "player_skip": ["webpage", "configs"],
+                }
             }
             try:
-                with yt_dlp.YoutubeDL(attempt2_opts) as ydl:
+                with yt_dlp.YoutubeDL(mobile_fallback_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
             except yt_dlp.utils.DownloadError as retry_exc:
-                if not cookies_used:
-                    raise RuntimeError(f"Failed to download YouTube video: {retry_exc}") from retry_exc
-                # Attempt 3: Retry without cookies for public videos on datacenter IPs.
-                attempt3_opts = {
-                    k: v
-                    for k, v in attempt2_opts.items()
-                    if k not in ("cookiefile", "cookiesfrombrowser")
-                }
-                try:
-                    with yt_dlp.YoutubeDL(attempt3_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                except yt_dlp.utils.DownloadError as final_exc:
-                    raise RuntimeError(f"Failed to download YouTube video: {final_exc}") from final_exc
+                raise RuntimeError(f"Failed to download YouTube video: {retry_exc}") from retry_exc
         elif "requested format is not available" in lower_msg:
             fallback_opts = {**ydl_opts, "format": "best"}
             fallback_opts.pop("merge_output_format", None)
