@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -589,11 +590,17 @@ def download_youtube_video(
     resolved_po_token = (po_token or os.environ.get("YOUTUBE_PO_TOKEN") or "").strip()
     resolved_pot_server = (pot_server_url or os.environ.get("YOUTUBE_POT_SERVER_URL") or "").strip()
 
+    is_local = sys.platform in ("win32", "darwin")
     ytdl_logger = _YtDlpLogger()
-    youtube_args: dict[str, Any] = {
-        "player_client": ["ios", "android", "mweb"],
-        "player_skip": ["configs", "webpage"],
-    }
+    if is_local:
+        youtube_args: dict[str, Any] = {
+            "player_client": ["web", "mweb", "android"],
+        }
+    else:
+        youtube_args = {
+            "player_client": ["ios", "android", "mweb"],
+            "player_skip": ["configs", "webpage"],
+        }
     if resolved_po_token:
         youtube_args["po_token"] = [resolved_po_token]
 

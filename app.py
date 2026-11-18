@@ -98,14 +98,15 @@ with st.expander("Gemini API Settings (Free Tier)", expanded=not bool(default_ap
 
 tab_yt, tab_upload = st.tabs(["YouTube URL", "Upload Video File (.mp4 / .mov)"])
 
-po_token = get_secret("YOUTUBE_PO_TOKEN") or None
-pot_server_url = get_secret("YOUTUBE_POT_SERVER_URL") or None
+is_local = sys.platform in ("win32", "darwin")
+po_token = None if is_local else (get_secret("YOUTUBE_PO_TOKEN") or None)
+pot_server_url = None if is_local else (get_secret("YOUTUBE_POT_SERVER_URL") or None)
 
 with tab_yt:
     url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
 
     session_cookie_file = _get_session_cookie_dir() / "cookies.txt"
-    secret_cookies_text = get_secret("YOUTUBE_COOKIES")
+    secret_cookies_text = "" if is_local else get_secret("YOUTUBE_COOKIES")
     local_root_cookies = Path(__file__).resolve().parent / "cookies.txt"
 
     if secret_cookies_text and not session_cookie_file.exists():
@@ -139,7 +140,7 @@ with tab_yt:
 
     with st.expander(
         "YouTube Authentication (cookies.txt)",
-        expanded=cookie_check.status != AuthStatus.PARSED,
+        expanded=cookie_check.status not in {AuthStatus.PARSED, AuthStatus.VERIFIED},
     ):
         st.markdown(
             """
@@ -220,7 +221,7 @@ with tab_yt:
     if "last_yt_error" in st.session_state:
         err_cat, err_msg = st.session_state["last_yt_error"]
         st.error(err_msg)
-        if err_cat in {
+        if not is_local and err_cat in {
             DownloadErrorCategory.BOT_VERIFICATION.value,
             DownloadErrorCategory.CLOUD_IP_BLOCKED.value,
             DownloadErrorCategory.MISSING_PO_TOKEN.value,
