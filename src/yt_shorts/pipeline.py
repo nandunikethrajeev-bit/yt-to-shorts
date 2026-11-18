@@ -14,6 +14,7 @@ from yt_shorts.downloader import (
     DownloadResult,
     _transcribe_with_faster_whisper,
     download_youtube_video,
+    validate_video_file,
 )
 from yt_shorts.editor import LayoutMode, render_short_clip, resolve_ffmpeg_exe
 
@@ -77,6 +78,8 @@ def run_pipeline(
     max_height: int = 1080,
     cleanup_cache: bool = True,
     local_video_path: Path | None = None,
+    po_token: str | None = None,
+    pot_server_url: str | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     """Download a YouTube video (or use a local file), pick highlights, and render 9:16 Shorts."""
@@ -87,10 +90,8 @@ def run_pipeline(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     if local_video_path is not None:
-        if not local_video_path.exists():
-            raise FileNotFoundError(f"Uploaded video file not found: {local_video_path}")
-        notify(f"Inspecting uploaded video '{local_video_path.name}'...")
-        duration = _probe_video_duration(local_video_path, ffmpeg_exe)
+        notify(f"Validating uploaded video '{local_video_path.name}'...")
+        duration = validate_video_file(local_video_path, ffmpeg_exe)
         transcript = _transcribe_with_faster_whisper(local_video_path)
         video_id = _slugify(local_video_path.stem, max_len=24) or "uploaded_video"
         dl = DownloadResult(
@@ -111,6 +112,8 @@ def run_pipeline(
             cookies_from_browser=cookies_from_browser,
             cookies_file=cookies_file,
             max_height=max_height,
+            po_token=po_token,
+            pot_server_url=pot_server_url,
         )
         notify(f"Downloaded '{dl.title}' ({dl.duration:.0f}s). Selecting top {num_clips} clips...")
     else:
@@ -172,9 +175,6 @@ def run_pipeline(
     if cleanup_cache:
         if local_video_path is None or dl.video_path.resolve().parent == work_dir.resolve():
             dl.video_path.unlink(missing_ok=True)
-        for temp_file in work_dir.iterdir():
-            if temp_file.is_file():
-                temp_file.unlink(missing_ok=True)
 
     notify(f"Done! Saved {len(rendered)} Shorts to {video_out_dir}")
 

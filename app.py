@@ -12,6 +12,13 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from yt_shorts.downloader import (
+    AuthStatus,
+    DownloadErrorCategory,
+    YouTubeDownloadError,
+    inspect_cookie_file,
+    verify_youtube_auth,
+)  # noqa: E402
 from yt_shorts.pipeline import PipelineResult, run_pipeline  # noqa: E402
 
 load_dotenv()
@@ -91,6 +98,9 @@ with st.expander("Gemini API Settings (Free Tier)", expanded=not bool(default_ap
 
 tab_yt, tab_upload = st.tabs(["YouTube URL", "Upload Video File (.mp4 / .mov)"])
 
+po_token = get_secret("YOUTUBE_PO_TOKEN") or None
+pot_server_url = get_secret("YOUTUBE_POT_SERVER_URL") or None
+
 with tab_yt:
     url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
 
@@ -101,21 +111,38 @@ with tab_yt:
     if secret_cookies_text and not session_cookie_file.exists():
         session_cookie_file.write_text(secret_cookies_text, encoding="utf-8")
 
-    has_session_cookies = session_cookie_file.exists() and session_cookie_file.stat().st_size > 0
-    has_local_cookies = local_root_cookies.exists() and local_root_cookies.stat().st_size > 0
-    has_active_cookies = has_session_cookies or has_local_cookies
+    active_cookie_file: Path | None = None
+    if session_cookie_file.exists() and session_cookie_file.stat().st_size > 0:
+        active_cookie_file = session_cookie_file
+    elif local_root_cookies.exists() and local_root_cookies.stat().st_size > 0:
+        active_cookie_file = local_root_cookies
 
-    if has_active_cookies:
-        st.success("✅ YouTube cookies are active for this session! Age-restricted videos are unlocked.")
+    cookie_check = inspect_cookie_file(active_cookie_file)
+    verified_status = st.session_state.get("yt_auth_result")
+
+    def _render_auth_banner(check_res: Any) -> None:
+        if check_res.status == AuthStatus.VERIFIED:
+            st.success(f"🟢 **{check_res.status.value}** — {check_res.detail}")
+        elif check_res.status == AuthStatus.PARSED:
+            st.info(f"🟡 **{check_res.status.value}** — {check_res.detail}")
+        elif check_res.status == AuthStatus.CONFIGURED:
+            st.warning(f"🟠 **{check_res.status.value}** — {check_res.detail}")
+        elif check_res.status == AuthStatus.FAILED:
+            st.error(f"🔴 **{check_res.status.value}** — {check_res.detail}")
+        else:
+            st.info(f"⚪ **{check_res.status.value}** — Regular public videos work without cookies; upload `cookies.txt` for age-restricted videos.")
+
+    if verified_status is not None and active_cookie_file is not None:
+        _render_auth_banner(verified_status)
     else:
-        st.info("💡 **Tip:** Regular YouTube videos work with zero setup. To process **age-restricted** videos, add a `cookies.txt` file below.")
+        _render_auth_banner(cookie_check)
 
-    with st.expander("Unlock Age-Restricted & Private Videos (cookies.txt)", expanded=not has_active_cookies):
+    with st.expander(
+        "YouTube Authentication (cookies.txt)",
+        expanded=cookie_check.status != AuthStatus.PARSED,
+    ):
         st.markdown(
             """
-            **Why does this happen?**  
-            YouTube blocks unauthenticated downloads of age-restricted videos and often flags cloud datacenter IPs.
-            
             **Quick Setup (takes 30 seconds):**
             1. In Brave or Chrome (Incognito/Private window), sign in to YouTube and open `https://www.youtube.com/robots.txt`.
             2. Export cookies with **[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)**, then close the Incognito window.
@@ -129,9 +156,15 @@ with tab_yt:
         )
         if uploaded_cookies is not None:
             session_cookie_file.write_bytes(uploaded_cookies.getvalue())
-            st.success("Loaded `cookies.txt` for this session! You can now generate shorts from age-restricted videos.")
-            has_session_cookies = True
-            has_active_cookies = True
+            active_cookie_file = session_cookie_file
+            cookie_check = inspect_cookie_file(active_cookie_file)
+            st.session_state.pop("yt_auth_result", None)
+            _render_auth_banner(cookie_check)
+
+        if active_cookie_file is not None and st.button("Verify YouTube Cookies", key="btn_verify_cookies"):
+            with st.spinner("Verifying cookies against YouTube..."):
+                st.session_state["yt_auth_result"] = verify_youtube_auth(active_cookie_file)
+            st.rerun()
 
         if sys.platform in ("win32", "darwin"):
             cookies_browser = st.selectbox(
@@ -145,15 +178,6 @@ with tab_yt:
 
     if st.button("Generate Shorts from YouTube", type="primary", disabled=not url.strip(), key="btn_yt"):
         status_box = st.status("Starting pipeline...", expanded=True)
-        cookies_path: Path | None = None
-        if uploaded_cookies is not None:
-            session_cookie_file.write_bytes(uploaded_cookies.getvalue())
-            cookies_path = session_cookie_file
-        elif has_session_cookies:
-            cookies_path = session_cookie_file
-        elif has_local_cookies:
-            cookies_path = local_root_cookies
-
         try:
             result = run_pipeline(
                 url=url.strip(),
@@ -166,15 +190,49 @@ with tab_yt:
                 api_key=api_key.strip() or None,
                 model=model,
                 cookies_from_browser=None if cookies_browser == "none" else cookies_browser,
-                cookies_file=cookies_path,
+                cookies_file=active_cookie_file,
                 max_height=max_height,
+                po_token=po_token,
+                pot_server_url=pot_server_url,
                 on_progress=lambda msg: status_box.write(msg),
             )
+            st.session_state["last_yt_result"] = result
+            st.session_state.pop("last_yt_error", None)
+            if active_cookie_file is not None:
+                st.session_state["yt_auth_result"] = inspect_cookie_file(active_cookie_file)
             status_box.update(label=f"Created {len(result.clips)} Shorts!", state="complete")
-            _render_clips(result, key_prefix="yt")
+        except YouTubeDownloadError as exc:
+            status_box.update(label="Pipeline failed", state="error")
+            if exc.category in {
+                DownloadErrorCategory.INVALID_COOKIES,
+            } and active_cookie_file is not None:
+                from yt_shorts.downloader import CookieCheckResult
+
+                st.session_state["yt_auth_result"] = CookieCheckResult(
+                    status=AuthStatus.FAILED,
+                    detail="YouTube rejected the provided cookies.",
+                )
+            st.session_state["last_yt_error"] = (exc.category.value, str(exc))
         except Exception as exc:
             status_box.update(label="Pipeline failed", state="error")
-            st.error(str(exc))
+            st.session_state["last_yt_error"] = ("error", str(exc))
+
+    if "last_yt_error" in st.session_state:
+        err_cat, err_msg = st.session_state["last_yt_error"]
+        st.error(err_msg)
+        if err_cat in {
+            DownloadErrorCategory.BOT_VERIFICATION.value,
+            DownloadErrorCategory.CLOUD_IP_BLOCKED.value,
+            DownloadErrorCategory.MISSING_PO_TOKEN.value,
+        }:
+            st.warning(
+                "**Streamlit Cloud Datacenter IP Notice:** Shared cloud IPs are frequently blocked by YouTube "
+                "even with valid cookies. You can switch immediately to the **Upload Video File (.mp4 / .mov)** "
+                "tab above to clip any local video with 100% reliability."
+            )
+
+    if "last_yt_result" in st.session_state:
+        _render_clips(st.session_state["last_yt_result"], key_prefix="yt")
 
 with tab_upload:
     st.info("Upload any `.mp4`, `.mov`, `.mkv`, or `.webm` video directly to bypass YouTube download filters completely.")
@@ -205,8 +263,11 @@ with tab_upload:
                 model=model,
                 on_progress=lambda msg: status_box.write(msg),
             )
+            st.session_state["last_upload_result"] = result
             status_box.update(label=f"Created {len(result.clips)} Shorts!", state="complete")
-            _render_clips(result, key_prefix="upload")
         except Exception as exc:
             status_box.update(label="Pipeline failed", state="error")
             st.error(str(exc))
+
+    if "last_upload_result" in st.session_state:
+        _render_clips(st.session_state["last_upload_result"], key_prefix="upload")

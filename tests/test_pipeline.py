@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from yt_shorts.analyzer import ClipCandidate, _chunk_transcript, _clamp_and_dedupe_clips, select_clips_fallback
-from yt_shorts.downloader import TranscriptSegment, parse_subtitles_file
-from yt_shorts.editor import write_clip_ass_subtitles
+from yt_shorts.downloader import (
+    AuthStatus,
+    DownloadErrorCategory,
+    TranscriptSegment,
+    YouTubeDownloadError,
+    download_youtube_video,
+    inspect_cookie_file,
+    parse_subtitles_file,
+    validate_video_file,
+    validate_youtube_url,
+    verify_youtube_auth,
+)
+from yt_shorts.editor import resolve_ffmpeg_exe, write_clip_ass_subtitles
+from yt_shorts.pipeline import run_pipeline
 
 
 class TestYtShorts(unittest.TestCase):
@@ -82,6 +97,238 @@ class TestYtShorts(unittest.TestCase):
         combined = "\n".join(text for _, _, text in chunks)
         for i in range(60):
             self.assertIn(f"Segment number {i} in long stream", combined)
+
+    def _make_sample_mp4(self, target: Path, duration_sec: int = 16) -> Path:
+        ffmpeg = resolve_ffmpeg_exe()
+        res = subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=blue:s=640x360:d={duration_sec}",
+                "-f",
+                "lavfi",
+                "-i",
+                f"anullsrc=r=44100:cl=stereo:d={duration_sec}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(res.returncode, 0, msg=res.stderr)
+        return target
+
+    def test_validate_youtube_url(self) -> None:
+        self.assertEqual(
+            validate_youtube_url("https://www.youtube.com/watch?v=jNQXAC9IVRw"),
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+        )
+        self.assertEqual(
+            validate_youtube_url("https://youtu.be/jNQXAC9IVRw"),
+            "https://youtu.be/jNQXAC9IVRw",
+        )
+        for bad in ["", "ftp://youtube.com/watch?v=1", "https://example.com/video.mp4"]:
+            with self.assertRaises(YouTubeDownloadError) as ctx:
+                validate_youtube_url(bad)
+            self.assertEqual(ctx.exception.category, DownloadErrorCategory.INVALID_URL)
+
+    def test_inspect_cookie_file_states(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            self.assertEqual(inspect_cookie_file(tmp_dir / "missing.txt").status, AuthStatus.NOT_CONFIGURED)
+
+            empty = tmp_dir / "empty.txt"
+            empty.write_text("", encoding="utf-8")
+            self.assertEqual(inspect_cookie_file(empty).status, AuthStatus.FAILED)
+
+            bad = tmp_dir / "bad.txt"
+            bad.write_text("not a netscape file", encoding="utf-8")
+            self.assertEqual(inspect_cookie_file(bad).status, AuthStatus.FAILED)
+
+            no_auth = tmp_dir / "no_auth.txt"
+            no_auth.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t0\tPREF\thl=en\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(inspect_cookie_file(no_auth).status, AuthStatus.CONFIGURED)
+
+            valid = tmp_dir / "valid.txt"
+            valid.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t2500000000\tLOGIN_INFO\tabc\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t2500000000\tSID\txyz\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t2500000000\tSAPISID\tqrs\n",
+                encoding="utf-8",
+            )
+            res = inspect_cookie_file(valid)
+            self.assertEqual(res.status, AuthStatus.PARSED)
+            self.assertTrue(res.has_auth_tokens)
+
+    def test_verify_youtube_auth_failure(self) -> None:
+        import yt_dlp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            valid = Path(tmp) / "cookies.txt"
+            valid.write_text(
+                "# Netscape HTTP Cookie File\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t2500000000\tLOGIN_INFO\tabc\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t2500000000\tSID\txyz\n"
+                ".youtube.com\tTRUE\t/\tTRUE\t2500000000\tSAPISID\tqrs\n",
+                encoding="utf-8",
+            )
+            with patch("yt_dlp.YoutubeDL") as mock_ydl:
+                mock_ydl.return_value.__enter__.return_value.extract_info.side_effect = (
+                    yt_dlp.utils.DownloadError("Sign in to confirm your age")
+                )
+                res = verify_youtube_auth(valid)
+                self.assertEqual(res.status, AuthStatus.FAILED)
+
+    def test_po_token_and_error_classifications(self) -> None:
+        import yt_dlp
+
+        captured_opts: list[dict] = []
+
+        class BotMockYDL:
+            def __init__(self, opts):
+                captured_opts.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, url, download=True):
+                raise yt_dlp.utils.DownloadError("Sign in to confirm you’re not a bot")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("yt_dlp.YoutubeDL", BotMockYDL):
+                with self.assertRaises(YouTubeDownloadError) as ctx:
+                    download_youtube_video(
+                        "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+                        Path(tmp),
+                        po_token="mweb.gvs+TESTTOKEN",
+                        pot_server_url="http://127.0.0.1:4416",
+                    )
+                self.assertEqual(ctx.exception.category, DownloadErrorCategory.BOT_VERIFICATION)
+                self.assertEqual(captured_opts[0]["extractor_args"]["youtube"]["po_token"], ["mweb.gvs+TESTTOKEN"])
+                self.assertEqual(
+                    captured_opts[0]["extractor_args"]["youtubepot-bgutilhttp"]["base_url"],
+                    ["http://127.0.0.1:4416"],
+                )
+
+        class UnavailableMockYDL:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, url, download=True):
+                raise yt_dlp.utils.DownloadError("Video unavailable. This video has been removed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("yt_dlp.YoutubeDL", UnavailableMockYDL):
+                with self.assertRaises(YouTubeDownloadError) as ctx:
+                    download_youtube_video("https://www.youtube.com/watch?v=jNQXAC9IVRw", Path(tmp))
+                self.assertEqual(ctx.exception.category, DownloadErrorCategory.VIDEO_UNAVAILABLE)
+
+    def test_network_timeout_exponential_backoff(self) -> None:
+        import yt_dlp
+
+        attempts = {"n": 0}
+
+        class TimeoutMockYDL:
+            def __init__(self, opts):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, url, download=True):
+                attempts["n"] += 1
+                raise yt_dlp.utils.DownloadError("Read timed out")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("yt_dlp.YoutubeDL", TimeoutMockYDL), patch("yt_shorts.downloader.time.sleep") as mock_sleep:
+                with self.assertRaises(YouTubeDownloadError) as ctx:
+                    download_youtube_video("https://www.youtube.com/watch?v=jNQXAC9IVRw", Path(tmp))
+                self.assertEqual(ctx.exception.category, DownloadErrorCategory.NETWORK_TIMEOUT)
+                self.assertEqual(attempts["n"], 3)
+                self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [1, 2])
+
+    def test_concurrent_downloads_and_validation(self) -> None:
+        test_case = self
+
+        class SuccessMockYDL:
+            def __init__(self, opts):
+                self.outtmpl = opts["outtmpl"]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, url, download=True):
+                vid = url.split("v=")[-1]
+                target = Path(self.outtmpl.replace("%(id)s", vid).replace("%(ext)s", "mp4"))
+                test_case._make_sample_mp4(target, duration_sec=6)
+                return {"id": vid, "title": f"Title {vid}", "duration": 6.0}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            with patch("yt_dlp.YoutubeDL", SuccessMockYDL):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    f1 = pool.submit(download_youtube_video, "https://www.youtube.com/watch?v=vidA", out_dir, None, False)
+                    f2 = pool.submit(download_youtube_video, "https://www.youtube.com/watch?v=vidB", out_dir, None, False)
+                    r1, r2 = f1.result(), f2.result()
+            self.assertNotEqual(r1.video_path, r2.video_path)
+            self.assertTrue(r1.video_path.exists())
+            self.assertTrue(r2.video_path.exists())
+            self.assertEqual(list(out_dir.glob("yt_dl_*")), [])
+
+    def test_direct_upload_workflow_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "_cache"
+            cache.mkdir(parents=True, exist_ok=True)
+            uploaded = self._make_sample_mp4(cache / "sample_upload.mp4", duration_sec=16)
+
+            result = run_pipeline(
+                local_video_path=uploaded,
+                output_root=root,
+                num_clips=1,
+                min_sec=15.0,
+                max_sec=20.0,
+                layout="blur",
+                burn_captions=False,
+                cleanup_cache=True,
+            )
+            self.assertEqual(len(result.clips), 1)
+            clip_path = result.clips[0].file_path
+            self.assertTrue(clip_path.exists())
+            self.assertGreater(clip_path.stat().st_size, 0)
+            self.assertGreater(validate_video_file(clip_path, resolve_ffmpeg_exe()), 10.0)
+            self.assertFalse(uploaded.exists())
 
 
 if __name__ == "__main__":
