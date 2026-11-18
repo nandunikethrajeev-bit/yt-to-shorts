@@ -201,6 +201,7 @@ def download_youtube_video(
         "logger": ytdl_logger,
         "remote_components": ["ejs:github"],
         "geo_bypass": True,
+        "check_formats": False,
         "socket_timeout": 30,
         "http_headers": {
             "User-Agent": (
@@ -239,35 +240,47 @@ def download_youtube_video(
         ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
     try:
+        # Attempt 1: Standard download with configured options.
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc)
         lower_msg = msg.lower()
-        if (
-            "the page needs to be reloaded" in lower_msg
+        is_bot_or_403 = (
+            "not a bot" in lower_msg
+            or "the page needs to be reloaded" in lower_msg
             or "http error 403" in lower_msg
             or "403: forbidden" in lower_msg
-        ):
-            mobile_opts = {
+            or ("sign in to confirm" in lower_msg and "confirm your age" not in lower_msg)
+        )
+        if is_bot_or_403:
+            # Attempt 2: Retry with embedded/mobile web clients and skipped configs/webpage.
+            attempt2_opts = {
                 **ydl_opts,
-                "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["tv_embedded", "mweb"],
+                        "player_skip": ["webpage", "configs"],
+                    }
+                },
             }
             try:
-                with yt_dlp.YoutubeDL(mobile_opts) as ydl:
+                with yt_dlp.YoutubeDL(attempt2_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
             except yt_dlp.utils.DownloadError as retry_exc:
-                # For public videos, retrying without cookies on mobile clients often bypasses 403.
-                cookieless_opts = {
+                if not cookies_used:
+                    raise RuntimeError(f"Failed to download YouTube video: {retry_exc}") from retry_exc
+                # Attempt 3: Retry without cookies for public videos on datacenter IPs.
+                attempt3_opts = {
                     k: v
-                    for k, v in mobile_opts.items()
+                    for k, v in attempt2_opts.items()
                     if k not in ("cookiefile", "cookiesfrombrowser")
                 }
                 try:
-                    with yt_dlp.YoutubeDL(cookieless_opts) as ydl:
+                    with yt_dlp.YoutubeDL(attempt3_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
-                except yt_dlp.utils.DownloadError:
-                    raise RuntimeError(f"Failed to download YouTube video: {retry_exc}") from retry_exc
+                except yt_dlp.utils.DownloadError as final_exc:
+                    raise RuntimeError(f"Failed to download YouTube video: {final_exc}") from final_exc
         elif "requested format is not available" in lower_msg:
             fallback_opts = {**ydl_opts, "format": "best"}
             fallback_opts.pop("merge_output_format", None)

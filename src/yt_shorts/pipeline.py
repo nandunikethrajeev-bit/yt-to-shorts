@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
 from yt_shorts.analyzer import ClipCandidate, select_clips_with_gemini
-from yt_shorts.downloader import DownloadResult, download_youtube_video
+from yt_shorts.downloader import (
+    DownloadResult,
+    _transcribe_with_faster_whisper,
+    download_youtube_video,
+)
 from yt_shorts.editor import LayoutMode, render_short_clip, resolve_ffmpeg_exe
 
 
@@ -42,8 +47,23 @@ def _slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len] or "clip"
 
 
+def _probe_video_duration(video_path: Path, ffmpeg_exe: str) -> float:
+    """Probe a local video's duration in seconds using ffmpeg."""
+    result = subprocess.run(
+        [ffmpeg_exe, "-i", str(video_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr or "")
+    if not match:
+        return 0.0
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
 def run_pipeline(
-    url: str,
+    url: str | None = None,
     output_root: Path = Path("output"),
     num_clips: int = 3,
     min_sec: float = 15.0,
@@ -56,24 +76,45 @@ def run_pipeline(
     cookies_file: Path | None = None,
     max_height: int = 1080,
     cleanup_cache: bool = True,
+    local_video_path: Path | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> PipelineResult:
-    """Download a YouTube video, pick 15-30s highlights, and render 9:16 Shorts."""
+    """Download a YouTube video (or use a local file), pick highlights, and render 9:16 Shorts."""
     notify = on_progress or (lambda _msg: None)
 
     ffmpeg_exe = resolve_ffmpeg_exe()
-    notify("Downloading video and captions with yt-dlp...")
     work_dir = output_root / "_cache"
-    dl: DownloadResult = download_youtube_video(
-        url=url,
-        output_dir=work_dir,
-        ffmpeg_location=ffmpeg_exe,
-        cookies_from_browser=cookies_from_browser,
-        cookies_file=cookies_file,
-        max_height=max_height,
-    )
+    work_dir.mkdir(parents=True, exist_ok=True)
 
-    notify(f"Downloaded '{dl.title}' ({dl.duration:.0f}s). Selecting top {num_clips} clips...")
+    if local_video_path is not None:
+        if not local_video_path.exists():
+            raise FileNotFoundError(f"Uploaded video file not found: {local_video_path}")
+        notify(f"Inspecting uploaded video '{local_video_path.name}'...")
+        duration = _probe_video_duration(local_video_path, ffmpeg_exe)
+        transcript = _transcribe_with_faster_whisper(local_video_path)
+        video_id = _slugify(local_video_path.stem, max_len=24) or "uploaded_video"
+        dl = DownloadResult(
+            video_id=video_id,
+            title=local_video_path.stem,
+            duration=duration,
+            video_path=local_video_path,
+            transcript=transcript,
+            heatmap=[],
+        )
+        notify(f"Loaded '{dl.title}' ({dl.duration:.0f}s). Selecting top {num_clips} clips...")
+    elif url:
+        notify("Downloading video and captions with yt-dlp...")
+        dl = download_youtube_video(
+            url=url,
+            output_dir=work_dir,
+            ffmpeg_location=ffmpeg_exe,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file,
+            max_height=max_height,
+        )
+        notify(f"Downloaded '{dl.title}' ({dl.duration:.0f}s). Selecting top {num_clips} clips...")
+    else:
+        raise ValueError("Either a YouTube URL or a local video file must be provided.")
     candidates: list[ClipCandidate] = select_clips_with_gemini(
         title=dl.title,
         video_duration=dl.duration,
@@ -129,7 +170,8 @@ def run_pipeline(
     summary_path.write_text(json.dumps(summary_data, indent=2), encoding="utf-8")
 
     if cleanup_cache:
-        dl.video_path.unlink(missing_ok=True)
+        if local_video_path is None or dl.video_path.resolve().parent == work_dir.resolve():
+            dl.video_path.unlink(missing_ok=True)
         for temp_file in work_dir.iterdir():
             if temp_file.is_file():
                 temp_file.unlink(missing_ok=True)

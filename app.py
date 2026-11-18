@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from yt_shorts.pipeline import run_pipeline  # noqa: E402
+from yt_shorts.pipeline import PipelineResult, run_pipeline  # noqa: E402
 
 load_dotenv()
 
@@ -38,11 +38,27 @@ def _get_session_cookie_dir() -> Path:
     return cookie_dir
 
 
+def _render_clips(result: PipelineResult, key_prefix: str) -> None:
+    """Render generated Shorts clips and download buttons."""
+    for clip in result.clips:
+        st.subheader(f"{clip.index}. {clip.hook_title}")
+        st.caption(
+            f"{clip.start_time:.1f}s – {clip.end_time:.1f}s ({clip.duration:.1f}s) | "
+            f"Score: {clip.viral_score}/100 | {clip.reason}"
+        )
+        st.video(str(clip.file_path))
+        st.download_button(
+            label=f"Download {clip.file_path.name}",
+            data=clip.file_path.read_bytes(),
+            file_name=clip.file_path.name,
+            mime="video/mp4",
+            key=f"{key_prefix}_dl_{clip.index}",
+        )
+
+
 st.set_page_config(page_title="YouTube to Shorts (Free)", page_icon="🎬", layout="centered")
 st.title("YouTube to Shorts (15–30s)")
-st.caption("100% free local converter using yt-dlp, ffmpeg, and your Gemini API key.")
-
-url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
+st.caption("100% free converter using yt-dlp, ffmpeg, and your Gemini API key.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -73,99 +89,124 @@ with st.expander("Gemini API Settings (Free Tier)", expanded=not bool(default_ap
         index=0,
     )
 
-session_cookie_file = _get_session_cookie_dir() / "cookies.txt"
-secret_cookies_text = get_secret("YOUTUBE_COOKIES")
-local_root_cookies = Path(__file__).resolve().parent / "cookies.txt"
+tab_yt, tab_upload = st.tabs(["YouTube URL", "Upload Video File (.mp4 / .mov)"])
 
-if secret_cookies_text and not session_cookie_file.exists():
-    session_cookie_file.write_text(secret_cookies_text, encoding="utf-8")
+with tab_yt:
+    url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
 
-has_session_cookies = session_cookie_file.exists() and session_cookie_file.stat().st_size > 0
-has_local_cookies = local_root_cookies.exists() and local_root_cookies.stat().st_size > 0
-has_active_cookies = has_session_cookies or has_local_cookies
+    session_cookie_file = _get_session_cookie_dir() / "cookies.txt"
+    secret_cookies_text = get_secret("YOUTUBE_COOKIES")
+    local_root_cookies = Path(__file__).resolve().parent / "cookies.txt"
 
-if has_active_cookies:
-    st.success("✅ YouTube cookies are active for this session! Age-restricted videos are unlocked.")
-else:
-    st.info("💡 **Tip:** Regular YouTube videos work with zero setup. To process **age-restricted** videos, add a `cookies.txt` file below.")
+    if secret_cookies_text and not session_cookie_file.exists():
+        session_cookie_file.write_text(secret_cookies_text, encoding="utf-8")
 
-with st.expander("Unlock Age-Restricted & Private Videos (cookies.txt)", expanded=not has_active_cookies):
-    st.markdown(
-        """
-        **Why does this happen?**  
-        YouTube blocks unauthenticated downloads of age-restricted videos and often flags cloud datacenter IPs.
-        
-        **Quick Setup (takes 30 seconds):**
-        1. In Brave or Chrome (Incognito/Private window), sign in to YouTube and open `https://www.youtube.com/robots.txt`.
-        2. Export cookies with **[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)**, then close the Incognito window.
-        3. Upload the exported `cookies.txt` below (stored only for your current session).
-        """
-    )
-    uploaded_cookies = st.file_uploader(
-        "Upload cookies.txt (Session-only)",
-        type=["txt"],
-        help="Export from YouTube using the 'Get cookies.txt LOCALLY' extension.",
-    )
-    if uploaded_cookies is not None:
-        session_cookie_file.write_bytes(uploaded_cookies.getvalue())
-        st.success("Loaded `cookies.txt` for this session! You can now generate shorts from age-restricted videos.")
-        has_session_cookies = True
-        has_active_cookies = True
+    has_session_cookies = session_cookie_file.exists() and session_cookie_file.stat().st_size > 0
+    has_local_cookies = local_root_cookies.exists() and local_root_cookies.stat().st_size > 0
+    has_active_cookies = has_session_cookies or has_local_cookies
 
-    if sys.platform in ("win32", "darwin"):
-        cookies_browser = st.selectbox(
-            "Or load cookies from browser (local only; requires browser to be closed)",
-            options=["none", "brave", "chrome", "edge", "firefox"],
-            index=0,
-            help="Note: Your browser must be completely closed for direct extraction due to OS file locks.",
-        )
+    if has_active_cookies:
+        st.success("✅ YouTube cookies are active for this session! Age-restricted videos are unlocked.")
     else:
-        cookies_browser = "none"
+        st.info("💡 **Tip:** Regular YouTube videos work with zero setup. To process **age-restricted** videos, add a `cookies.txt` file below.")
 
-if st.button("Generate Shorts", type="primary", disabled=not url.strip()):
-    status_box = st.status("Starting pipeline...", expanded=True)
-    cookies_path: Path | None = None
-    if uploaded_cookies is not None:
-        session_cookie_file.write_bytes(uploaded_cookies.getvalue())
-        cookies_path = session_cookie_file
-    elif has_session_cookies:
-        cookies_path = session_cookie_file
-    elif has_local_cookies:
-        cookies_path = local_root_cookies
-
-    try:
-
-        result = run_pipeline(
-            url=url.strip(),
-            output_root=Path("output"),
-            num_clips=num_clips,
-            min_sec=float(min_sec),
-            max_sec=float(max_sec),
-            layout=layout,
-            burn_captions=burn_captions,
-            api_key=api_key.strip() or None,
-            model=model,
-            cookies_from_browser=None if cookies_browser == "none" else cookies_browser,
-            cookies_file=cookies_path,
-            max_height=max_height,
-            on_progress=lambda msg: status_box.write(msg),
+    with st.expander("Unlock Age-Restricted & Private Videos (cookies.txt)", expanded=not has_active_cookies):
+        st.markdown(
+            """
+            **Why does this happen?**  
+            YouTube blocks unauthenticated downloads of age-restricted videos and often flags cloud datacenter IPs.
+            
+            **Quick Setup (takes 30 seconds):**
+            1. In Brave or Chrome (Incognito/Private window), sign in to YouTube and open `https://www.youtube.com/robots.txt`.
+            2. Export cookies with **[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)**, then close the Incognito window.
+            3. Upload the exported `cookies.txt` below (stored only for your current session).
+            """
         )
-        status_box.update(label=f"Created {len(result.clips)} Shorts!", state="complete")
+        uploaded_cookies = st.file_uploader(
+            "Upload cookies.txt (Session-only)",
+            type=["txt"],
+            help="Export from YouTube using the 'Get cookies.txt LOCALLY' extension.",
+        )
+        if uploaded_cookies is not None:
+            session_cookie_file.write_bytes(uploaded_cookies.getvalue())
+            st.success("Loaded `cookies.txt` for this session! You can now generate shorts from age-restricted videos.")
+            has_session_cookies = True
+            has_active_cookies = True
 
-        for clip in result.clips:
-            st.subheader(f"{clip.index}. {clip.hook_title}")
-            st.caption(
-                f"{clip.start_time:.1f}s – {clip.end_time:.1f}s ({clip.duration:.1f}s) | "
-                f"Score: {clip.viral_score}/100 | {clip.reason}"
+        if sys.platform in ("win32", "darwin"):
+            cookies_browser = st.selectbox(
+                "Or load cookies from browser (local only; requires browser to be closed)",
+                options=["none", "brave", "chrome", "edge", "firefox"],
+                index=0,
+                help="Note: Your browser must be completely closed for direct extraction due to OS file locks.",
             )
-            st.video(str(clip.file_path))
-            st.download_button(
-                label=f"Download {clip.file_path.name}",
-                data=clip.file_path.read_bytes(),
-                file_name=clip.file_path.name,
-                mime="video/mp4",
-                key=f"dl_{clip.index}",
+        else:
+            cookies_browser = "none"
+
+    if st.button("Generate Shorts from YouTube", type="primary", disabled=not url.strip(), key="btn_yt"):
+        status_box = st.status("Starting pipeline...", expanded=True)
+        cookies_path: Path | None = None
+        if uploaded_cookies is not None:
+            session_cookie_file.write_bytes(uploaded_cookies.getvalue())
+            cookies_path = session_cookie_file
+        elif has_session_cookies:
+            cookies_path = session_cookie_file
+        elif has_local_cookies:
+            cookies_path = local_root_cookies
+
+        try:
+            result = run_pipeline(
+                url=url.strip(),
+                output_root=Path("output"),
+                num_clips=num_clips,
+                min_sec=float(min_sec),
+                max_sec=float(max_sec),
+                layout=layout,
+                burn_captions=burn_captions,
+                api_key=api_key.strip() or None,
+                model=model,
+                cookies_from_browser=None if cookies_browser == "none" else cookies_browser,
+                cookies_file=cookies_path,
+                max_height=max_height,
+                on_progress=lambda msg: status_box.write(msg),
             )
-    except Exception as exc:
-        status_box.update(label="Pipeline failed", state="error")
-        st.error(str(exc))
+            status_box.update(label=f"Created {len(result.clips)} Shorts!", state="complete")
+            _render_clips(result, key_prefix="yt")
+        except Exception as exc:
+            status_box.update(label="Pipeline failed", state="error")
+            st.error(str(exc))
+
+with tab_upload:
+    st.info("Upload any `.mp4`, `.mov`, `.mkv`, or `.webm` video directly to bypass YouTube download filters completely.")
+    uploaded_video = st.file_uploader(
+        "Upload Video File (.mp4 / .mov)",
+        type=["mp4", "mov", "mkv", "webm"],
+        help="Your video is processed locally in the container and temporary files are cleaned up after rendering.",
+    )
+    if st.button("Generate Shorts from Uploaded Video", type="primary", disabled=uploaded_video is None, key="btn_upload"):
+        assert uploaded_video is not None
+        status_box = st.status("Saving uploaded video...", expanded=True)
+        try:
+            cache_dir = Path("output") / "_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = Path(uploaded_video.name).name
+            local_video_path = cache_dir / safe_name
+            local_video_path.write_bytes(uploaded_video.getvalue())
+
+            result = run_pipeline(
+                local_video_path=local_video_path,
+                output_root=Path("output"),
+                num_clips=num_clips,
+                min_sec=float(min_sec),
+                max_sec=float(max_sec),
+                layout=layout,
+                burn_captions=burn_captions,
+                api_key=api_key.strip() or None,
+                model=model,
+                on_progress=lambda msg: status_box.write(msg),
+            )
+            status_box.update(label=f"Created {len(result.clips)} Shorts!", state="complete")
+            _render_clips(result, key_prefix="upload")
+        except Exception as exc:
+            status_box.update(label="Pipeline failed", state="error")
+            st.error(str(exc))
