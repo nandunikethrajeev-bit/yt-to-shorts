@@ -200,12 +200,20 @@ def download_youtube_video(
         "no_warnings": False,
         "logger": ytdl_logger,
         "remote_components": ["ejs:github"],
+        "geo_bypass": True,
+        "socket_timeout": 30,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "en-US,en;q=0.9",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "mweb", "web"],
+                "player_skip": ["configs", "webpage"],
+            }
         },
     }
     if js_runtimes:
@@ -230,37 +238,37 @@ def download_youtube_video(
         cookies_used = True
         ydl_opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
-    if cookies_used:
-        # Prefer mweb/tv/android ahead of desktop web to avoid "page needs to be reloaded" blocks.
-        ydl_opts["extractor_args"] = {"youtube": {"player_client": ["mweb", "tv", "web", "android"]}}
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as exc:
         msg = str(exc)
-        if "the page needs to be reloaded" in msg.lower():
-            reload_fallback_opts = {
+        lower_msg = msg.lower()
+        if (
+            "the page needs to be reloaded" in lower_msg
+            or "http error 403" in lower_msg
+            or "403: forbidden" in lower_msg
+        ):
+            mobile_opts = {
                 **ydl_opts,
-                "extractor_args": {"youtube": {"player_client": ["mweb", "android"]}},
+                "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
             }
             try:
-                with yt_dlp.YoutubeDL(reload_fallback_opts) as ydl:
+                with yt_dlp.YoutubeDL(mobile_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
             except yt_dlp.utils.DownloadError as retry_exc:
-                # If cookies + mobile clients still hit the reload block, try cookieless mobile clients.
+                # For public videos, retrying without cookies on mobile clients often bypasses 403.
                 cookieless_opts = {
                     k: v
-                    for k, v in reload_fallback_opts.items()
+                    for k, v in mobile_opts.items()
                     if k not in ("cookiefile", "cookiesfrombrowser")
                 }
-                cookieless_opts["extractor_args"] = {"youtube": {"player_client": ["android", "ios"]}}
                 try:
                     with yt_dlp.YoutubeDL(cookieless_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                 except yt_dlp.utils.DownloadError:
                     raise RuntimeError(f"Failed to download YouTube video: {retry_exc}") from retry_exc
-        elif "requested format is not available" in msg.lower():
+        elif "requested format is not available" in lower_msg:
             fallback_opts = {**ydl_opts, "format": "best"}
             fallback_opts.pop("merge_output_format", None)
             try:
